@@ -1,4 +1,4 @@
-# 🔬 ResearchIt v2.0 - AI-Powered Research Intelligence Platform
+# 🔬 ResearchIt  - AI-Powered Research Intelligence Platform
 
 A modern, dark-themed research intelligence platform with advanced features for academic paper discovery, gap detection, and proposal generation.
 
