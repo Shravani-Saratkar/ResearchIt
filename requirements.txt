@@ -10,3 +10,4 @@ scipy
 scikit-learn
 networkx
 pyvis
+python-dotenv
