@@ -6,15 +6,18 @@ Main entry point.
 import streamlit as st
 import sys
 from pathlib import Path
-from dotenv import load_dotenv
+import os
 
-load_dotenv()
-# Make both root and services/ importable so pages can do
-# "from simple_rag import ..." OR "from services.simple_rag import ..."
 _root = Path(__file__).parent
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except:
+    pass
+
 sys.path.insert(0, str(_root))
 sys.path.insert(0, str(_root / "services"))
-
 
 # ✅ import theme FIRST
 from components.theme import apply_theme
