@@ -87,11 +87,19 @@ class PaperGenerator:
         titles = "; ".join(p.get("title","") for p in self.papers[:12])
         return _safe_call(
             self.model,
-            f"Given these paper titles: {titles}\n\n"
-            "In 5-8 words, name the common research topic. "
-            "Return ONLY the topic phrase, nothing else.",
-            "Emerging Research Area"
+            f"""
+        Given these paper titles:
+
+        {titles}
+
+        Return the COMMON research topic.
+        Use only words from titles.
+        Do not invent new domain.
+        Return 3-6 words only.
+        """,
+            "Research Topic"    
         )
+        
 
     def title(self) -> str:
         return _safe_call(
@@ -116,6 +124,10 @@ class PaperGenerator:
             f"Based on analysis of {len(self.papers)} papers.\n"
             f"Key gaps identified:\n{self.gap_ctx[:1000]}\n\n"
             "Requirements:\n"
+            "Write as if this will be submitted as a real research paper."
+            "Use formal academic tone."
+            "Use concrete methods."
+            "Avoid generic statements."
             "- EXACTLY 250-300 words\n"
             "- Structure with these elements:\n"
             "  1. Background (why this topic matters)\n"
@@ -142,6 +154,10 @@ class PaperGenerator:
             f"Identified gaps:\n{self.gap_ctx[:700]}\n\n"
             "Requirements:\n"
             "- 650-750 words total\n"
+            "Write as if this will be submitted as a real research paper."
+            "Use formal academic tone."
+            "Use concrete methods."
+            "Avoid generic statements."
             "- Structure with bold inline sub-headings:\n"
             "  **Background** (2-3 paragraphs):\n"
             "    - Why this research area is important\n"
@@ -173,10 +189,19 @@ TOPIC: {self.topic}
 
 PAPERS TO REVIEW (cite these by author and year):
 {self.paper_ctx}
+IMPORTANT:
+    Use ONLY the papers provided.
+    Do not invent authors.
+    Do not invent datasets.
+    Do not invent methods.
+    Every paragraph must refer to the given papers.
 
 CRITICAL INSTRUCTIONS:
 You MUST write 950-1150 words organized into these EXACT sub-sections with bold headings:
-
+"Write as if this will be submitted as a real research paper."
+            "Use formal academic tone."
+            "Use concrete methods."
+            "Avoid generic statements."
 **Overview** (1 paragraph, ~120 words):
   - Summarize the breadth of literature: number of papers, year range, major publication venues
   - Identify 2-3 overarching themes or trends across the corpus
@@ -254,95 +279,61 @@ the gap analysis that follows."""
     def gap_analysis(self) -> str:
         """COMPLETELY REWRITTEN with structured gap reporting."""
         n = len(self.papers)
-        prompt = f"""You are writing the Gap Analysis section of an academic research paper.
+        prompt = f"""
+        You are writing the GAP ANALYSIS section of a research paper.
 
-TOPIC: {self.topic}
-PAPERS ANALYZED: {n}
+        TOPIC: {self.topic}
 
-DETECTED GAPS:
-{self.gap_ctx}
+        PAPERS ANALYSED:
+        {self.paper_ctx}
 
-CRITICAL INSTRUCTIONS:
-You MUST write 750-950 words organized into these EXACT sub-sections with bold headings:
+        DETECTED GAPS:
+        {self.gap_ctx}
 
-**Overview** (~100 words):
-  - Explain how gaps were identified: systematic analysis of {n} papers
-  - Mention the dimensions analyzed (methodological, empirical, theoretical, application)
-  - State that gaps are categorized by severity and impact
+        Instructions:
 
-**Methodological Gaps** (~150 words):
-  - List and explain 2-3 specific methodological gaps from the data above
-  - For EACH gap: describe it clearly, explain why it matters, state what opportunities it creates
-  - Use the severity and evidence provided in the gap data
-  - Be concrete and specific
+        Write the gap section as a realistic research paper section.
 
-**Empirical Gaps** (~150 words):
-  - List and explain 2-3 specific empirical gaps (datasets, experiments, validation)
-  - Discuss what real-world contexts or data sources are missing
-  - Explain the implications of these gaps
-  - Reference specific evidence from the gap data
+        Rules:
 
-**Theoretical Gaps** (~120 words):
-  - Identify theoretical or conceptual gaps
-  - What frameworks or theories are absent or incomplete?
-  - Why does this theoretical weakness matter?
-  - How would addressing it advance the field?
+        - DO NOT use headings like Methodological / Empirical / Theoretical
+        - DO NOT write generic statements
+        - DO NOT invent gaps
+        - Use only the detected gaps and papers above
+        - Write in academic style
+        - Use bullet points for each gap
+        - Each gap must be specific and based on papers
 
-**Application Gaps** (~120 words):
-  - What domains or use-cases remain unexplored?
-  - What prevents broader application?
-  - What opportunities exist for transfer to new domains?
+        Format:
 
-**Summary and Prioritization** (~150 words):
-  - Synthesize all gaps into a coherent narrative
-  - Prioritize gaps by severity and feasibility
-  - For the top 3 gaps: state type, severity, specific future work needed
-  - Connect back to research objectives from the Introduction
+        Write an introduction paragraph (4–5 lines)
 
-FORMATTING RULES:
-- Use bold headings exactly as shown above
-- Write in formal academic prose — NO bullet points or numbered lists
-- Reference the gap data provided (use severity levels, evidence)
-- Be specific and concrete — avoid vague statements
-- Maintain logical flow between sub-sections
+        Then list gaps as bullet points like:
 
-Return ONLY the section body. Do NOT include a "Gap Analysis" heading.
-Begin directly with "**Overview**"."""
+        • Gap 1 — explanation based on papers  
+        • Gap 2 — explanation based on papers  
+        • Gap 3 — explanation based on papers  
+        • Gap 4 — explanation based on papers  
 
-        fallback = f"""**Overview**
+        Each bullet must:
+        - mention technique / dataset / topic
+        - relate to papers
+        - explain why gap exists
+        - explain why important
 
-Through systematic analysis of {n} papers in {self.topic}, we identified critical gaps across 
-multiple dimensions. Gaps were categorized by severity and assessed for research impact and feasibility.
+        End with 1 short concluding paragraph.
+        """
 
-**Methodological Gaps**
+        fallback = f"""
+        The analysis of the reviewed papers reveals several important research gaps.
 
-Several methodological limitations constrain current research. Many studies rely on similar approaches, 
-leaving alternative methodologies underexplored. Hybrid approaches combining multiple techniques remain 
-rare, despite their potential to address complex research questions. These methodological gaps represent 
-high-impact opportunities for advancing the field.
+        • Limited combination of existing methods across the reviewed papers.
+        • Few studies evaluate results on diverse datasets.
+        • Several approaches lack real-world validation.
+        • Some topics mentioned in the papers remain under-explored.
 
-**Empirical Gaps**
-
-Empirical validation remains limited in scope and scale. Dataset diversity is insufficient, with 
-over-reliance on a small number of standard benchmarks. Real-world validation across diverse contexts 
-is notably absent. These empirical gaps threaten the generalizability of current findings.
-
-**Theoretical Gaps**
-
-Theoretical foundations require strengthening. Many studies demonstrate empirical results without 
-adequate theoretical explanation. Conceptual frameworks remain fragmented rather than unified. 
-Addressing these theoretical gaps would provide deeper understanding of underlying mechanisms.
-
-**Application Gaps**
-
-Promising application domains remain unexplored. Cross-domain transfer potential has not been fully 
-investigated. Integration with adjacent fields could unlock significant value but remains understudied.
-
-**Summary and Prioritization**
-
-The most critical gaps involve methodological diversity, empirical validation breadth, and theoretical 
-grounding. Addressing these gaps through targeted future research would substantially advance {self.topic}. 
-Priority should be given to gaps that simultaneously offer high impact and feasibility."""
+        These gaps indicate clear opportunities for future research.
+        """
 
         return _safe_call(self.model, prompt, fallback, max_retries=2)
 
@@ -358,7 +349,10 @@ IDENTIFIED GAPS:
 
 CRITICAL INSTRUCTIONS:
 You MUST write 420-500 words organized into these EXACT sub-sections with bold headings:
-
+"Write as if this will be submitted as a real research paper."
+            "Use formal academic tone."
+            "Use concrete methods."
+            "Avoid generic statements."
 **Summary of Findings** (~120 words):
   - Recap the main insights from the literature review
   - State the total number and types of gaps identified

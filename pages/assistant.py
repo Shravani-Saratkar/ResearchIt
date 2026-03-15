@@ -209,13 +209,23 @@ def render_message_card(content: str, role: str = "assistant"):
     
     else:  # AI message
         st.markdown(f"""
-        <div style="background: linear-gradient(135deg, rgba(251, 252, 249, 0.95), rgba(242, 244, 237, 0.8)); border: 1.5px solid #e8ebe3; border-radius: 12px; padding: 18px 24px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(45, 59, 47, 0.06);">
-            <div style="font-size: 12px; font-weight: 700; color: #C0C0C0; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; display: flex; align-items: center;">
+        <div style="background: #2A2A2A; border: 1px solid #3A3A3A;
+        border-radius: 12px; padding: 18px 24px; margin-bottom: 16px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.25);">
+
+            <div style="font-size: 12px; font-weight: 700;
+            color: #D4AF37; text-transform: uppercase;
+            letter-spacing: 0.08em; margin-bottom: 8px;">
                 🤖 AI Assistant
             </div>
-            <div style="color: #F5F5F0; font-size: 15px; line-height: 1.8; word-wrap: break-word;">
+
+            <div style="color: #F5F5F0;
+            font-size: 15px;
+            line-height: 1.8;
+            word-wrap: break-word;">
                 {content}
             </div>
+
         </div>
         """, unsafe_allow_html=True)
 
@@ -341,7 +351,7 @@ def render_assistant_page():
     # Input area with enhanced features
     spacing(20)
     
-    card_start("20px")
+    
     
     st.markdown("""
     <div style="font-size: 14px; font-weight: 600; color: #C0C0C0; margin-bottom: 12px;">
@@ -367,7 +377,7 @@ def render_assistant_page():
         spacing(5)
         send = st.button("🚀", use_container_width=True, help="Send message", key="send_btn")
 
-    card_end()
+    
 
     # Handle message sending
     if send and user_input:

@@ -47,7 +47,10 @@ def _infer_domain_from_papers(papers: List[Dict]) -> str:
         return "AI Research"
     
     # Collect keywords from paper titles
-    all_text = " ".join([p.get("title", "") for p in papers[:10]])
+    all_text = " ".join(
+        (p.get("title","") + " " + p.get("abstract",""))
+        for p in papers[:10]
+    )
     all_text = all_text.lower()
     
     # Domain detection patterns
@@ -138,33 +141,34 @@ def _generate_with_ai(gap: Dict, domain: str, problem: str, papers: List[Dict]) 
             f"- {p.get('title', '')}" for p in papers[:5]
         ])
         
-        prompt = f"""You are a research advisor. Generate ONE specific research opportunity.
+        prompt = f"""
+You must generate ONE research opportunity ONLY using the papers below.
 
-Domain: {domain}
-Gap: {gap.get('gap', '')}
-Problem: {problem}
-Category: {gap.get('category', '')}
+DOMAIN: {domain}
 
-Recent papers in this field:
+DETECTED GAP:
+{gap.get("gap","")}
+
+PROBLEM:
+{problem}
+
+PAPERS (USE ONLY THESE):
 {paper_context}
 
-Generate in this EXACT format:
+STRICT RULES:
+- Use only concepts appearing in these papers
+- Do not invent new domain
+- Do not generate generic AI topics
+- Opportunity must extend these papers
+- Mention real techniques / datasets if present
 
-TITLE: [Specific 8-12 word research title using real concepts from the domain]
+FORMAT:
 
-WHY: [2-3 sentences explaining: (1) What current work misses (2) Why this matters NOW (3) What breakthrough this enables]
-
-APPROACH: [4 specific research steps - be concrete, mention actual techniques/datasets/metrics from the domain]
-
-IMPACT: [2 sentences on SPECIFIC real-world applications in {domain} - no generic statements]
-
-STEPS: [3 concrete actions to start THIS WEEK - be specific about papers to read, tools to use, data to get]
-
-Rules:
-- Use REAL concepts from {domain}
-- Be SPECIFIC - no generic phrases
-- Make it sound like a real research project
-- Focus on {domain} applications ONLY
+TITLE:
+WHY:
+APPROACH:
+IMPACT:
+STEPS:
 """
         
         response = model.generate_content(prompt)

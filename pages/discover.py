@@ -77,6 +77,12 @@ def render_discover_page():
     if "papers_fetched" not in st.session_state:
         st.session_state.papers_fetched = False
 
+    if "collection" not in st.session_state:
+        st.session_state.collection = []
+
+    if "saved_papers" not in st.session_state:
+        st.session_state.saved_papers = []
+
     # Search section
     section_header("Search Papers", "🔎")
     
@@ -225,10 +231,22 @@ def render_discover_page():
                     st.markdown(f"[Open on ArXiv]({paper.get('url', '#')})")
             
             with col2:
-                st.button(f"💾 Save Paper {idx}", key=f"save_{idx}", use_container_width=True)
-            
+                if st.button(f"💾 Save Paper {idx}", key=f"save_{idx}", use_container_width=True):
+
+                    if paper not in st.session_state.saved_papers:
+                        st.session_state.saved_papers.append(paper)
+                        st.success("Saved")
+                    else:
+                        st.info("Already saved")
+
             with col3:
-                st.button(f"📋 Add to Collection {idx}", key=f"add_{idx}", use_container_width=True)
+                if st.button(f"📋 Add to Collection {idx}", key=f"add_{idx}", use_container_width=True):
+
+                    if paper not in st.session_state.collection:
+                        st.session_state.collection.append(paper)
+                        st.success("Added to collection")
+                    else:
+                        st.info("Already added")
             
             card_end()
             spacing(10)
@@ -254,13 +272,12 @@ def render_discover_page():
     
     elif st.session_state.papers_fetched and not st.session_state.papers:
         spacing(20)
-        card_start()
+        
         st.warning("❌ No papers found. Please try different keywords.")
-        card_end()
+        
     
     else:
         spacing(20)
-        card_start()
         st.info("""
         ### 📖 How to Use:
         
@@ -272,10 +289,9 @@ def render_discover_page():
         
         **Tips:**
         - Use multiple keywords separated by spaces
-        - You can try "Use Sample Papers" to test the app without ArXiv
         - Papers are fetched from ArXiv with rate limiting to avoid errors
         """)
-        card_end()
+        
 
 
 if __name__ == "__main__":
