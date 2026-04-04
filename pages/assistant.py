@@ -49,18 +49,10 @@ def _build_paper_context_text(papers_data: List[Dict], max_papers: int = 20) -> 
 
 
 def generate_ai_response(user_message: str, chat_history: List[Dict], papers_data: List) -> str:
-    """Call Gemini with full paper context and conversation history."""
-    import os
-    import google.generativeai as genai
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return ("⚠️ GEMINI_API_KEY not set. Please add it to your .env file.")
+    """Call Groq with full paper context and conversation history."""
+    from gemini_client import get_client
 
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-
         paper_ctx = _build_paper_context_text(papers_data)
 
         # Last 6 turns of conversation history for context
@@ -89,13 +81,15 @@ Instructions:
 - Use clear, academic but accessible language.
 - Structure longer answers with short paragraphs or bullet points.
 """
-        response = model.generate_content(prompt)
-        return (response.text or "").strip() or "I was unable to generate a response. Please try again."
+        result = get_client().generate(
+            prompt,
+            fallback="I was unable to generate a response. Please check your GROQ_API_KEY and try again."
+        )
+        return result.strip() or "I was unable to generate a response. Please try again."
 
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return f"⚠️ Error contacting Gemini: {e}"
-
+        logger.error(f"Groq error: {e}")
+        return f"⚠️ Error contacting Groq: {e}"
 
 def get_suggested_questions():
     """Generate contextual suggested questions based on papers"""
@@ -208,27 +202,23 @@ def render_message_card(content: str, role: str = "assistant"):
         """, unsafe_allow_html=True)
     
     else:  # AI message
-        st.markdown(f"""
-        <div style="background: #2A2A2A; border: 1px solid #3A3A3A;
-        border-radius: 12px; padding: 18px 24px; margin-bottom: 16px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.25);">
 
-            <div style="font-size: 12px; font-weight: 700;
-            color: #D4AF37; text-transform: uppercase;
-            letter-spacing: 0.08em; margin-bottom: 8px;">
-                🤖 AI Assistant
-            </div>
-
-            <div style="color: #F5F5F0;
-            font-size: 15px;
-            line-height: 1.8;
-            word-wrap: break-word;">
-                {content}
-            </div>
-
-        </div>
+        st.markdown("""
+        <div style="background: #2A2A2A;
+        border: 1px solid #3A3A3A;
+        border-radius: 12px;
+        padding: 18px 24px;
+        margin-bottom: 16px;">
         """, unsafe_allow_html=True)
 
+        st.markdown(
+        "<div style='font-size:12px;font-weight:700;color:#D4AF37;margin-bottom:8px;'>🤖 AI Assistant</div>",
+        unsafe_allow_html=True
+        )
+
+        st.markdown(content)
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 def render_assistant_page():
     """Main page renderer for AI research assistant"""

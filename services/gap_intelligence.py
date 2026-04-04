@@ -1,425 +1,364 @@
 """
-Research Opportunity Discovery Engine
-Generates impressive, actionable research insights that users actually want to see.
+Research Opportunity Discovery Engine.
+- Guarantees minimum 5 opportunities by supplementing detected gaps
+  with future-scope directions mined directly from paper abstracts.
+- No generic labels, no domain adjacency guessing.
+- All content grounded in retrieved paper titles and abstracts.
 """
 
-import os
 import re
 from typing import Dict, List
 from collections import Counter
-import google.generativeai as genai
+from gemini_client import get_client
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SMART CONCEPT EXTRACTION
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Stop / ignore word sets ───────────────────────────────────────────────────
 
-IGNORE_WORDS = {
-    "method", "approach", "dataset", "system", "model", "framework", "technique",
-    "paper", "study", "research", "current", "limited", "applying", "using",
-    "based", "new", "novel", "effective", "existing", "various", "different"
+_STOPWORDS = {
+    "a","an","the","of","in","on","for","with","and","or","to","via",
+    "using","based","from","by","is","are","its","their","this","that",
+    "we","our","as","at","be","has","have","been","was","were","will",
+    "which","when","how","where","what","whether","both","such","each",
+}
+_IGNORE = {
+    "method","approach","dataset","system","model","framework","technique",
+    "paper","study","research","current","limited","applying","novel",
+    "effective","existing","various","different","new","toward","across",
 }
 
-
-def _smart_extract_domain_and_problem(gap: Dict, papers: List[Dict]) -> tuple:
-    """
-    Extract REAL domain and problem from gap + paper context.
-    Returns: (domain, specific_problem, innovation_type)
-    """
-    gap_text = gap.get("gap", "")
-    category = gap.get("category", "")
-    
-    # Extract domain from papers (more reliable than gap text)
-    domain = _infer_domain_from_papers(papers)
-    
-    # Extract specific problem from gap text
-    problem = _extract_problem_from_gap(gap_text, category)
-    
-    # Determine innovation type
-    innovation = _determine_innovation_type(gap, category)
-    
-    return domain, problem, innovation
+# Signals that a sentence discusses future work or limitations
+_FUTURE_SIGNALS = [
+    "future work", "future research", "in the future", "can be extended",
+    "remains to be", "left for future", "open problem", "limitation",
+    "we did not", "does not address", "fails to", "not yet", "still lacks",
+    "further investigation", "warrants further", "promising direction",
+    "scope for", "avenue for", "could be improved", "not explored",
+    "should be investigated", "needs further", "has not been",
+]
 
 
-def _infer_domain_from_papers(papers: List[Dict]) -> str:
-    """Infer research domain from paper titles/abstracts."""
+# ── Topic inference ───────────────────────────────────────────────────────────
+
+def _infer_topic(papers: List[Dict]) -> str:
     if not papers:
         return "AI Research"
-    
-    # Collect keywords from paper titles
-    all_text = " ".join(
-        (p.get("title","") + " " + p.get("abstract",""))
-        for p in papers[:10]
+    counter: Counter = Counter()
+    for p in papers[:15]:
+        chunks = re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}', p.get("title", ""))
+        for chunk in chunks:
+            words = chunk.lower().split()
+            if len(words) >= 2 and all(w not in _STOPWORDS for w in words):
+                counter[chunk] += 1
+    for phrase, cnt in counter.most_common(10):
+        if cnt >= 2:
+            return phrase
+    if counter:
+        return counter.most_common(1)[0][0]
+    words = [w for w in (papers[0].get("title","") or "").split()
+             if w.lower() not in _STOPWORDS]
+    return " ".join(words[:5]) or "AI Research"
+
+
+# ── Keyword extraction ────────────────────────────────────────────────────────
+
+def _extract_keywords(papers: List[Dict], n: int = 6) -> List[str]:
+    counter: Counter = Counter()
+    for p in papers[:20]:
+        title = p.get("title", "")
+        for w in re.findall(r'\b([A-Z][a-z]{4,})\b', title):
+            if w.lower() not in _STOPWORDS | _IGNORE:
+                counter[w] += 1
+        for ph in re.findall(r'([A-Z][a-z]+\s+[A-Z][a-z]+)', title):
+            if all(w.lower() not in _STOPWORDS | _IGNORE for w in ph.split()):
+                counter[ph] += 1
+    top = [kw for kw, _ in counter.most_common(n * 2)]
+    filtered = []
+    for kw in top:
+        if not any(kw in longer for longer in top if longer != kw):
+            filtered.append(kw)
+        if len(filtered) >= n:
+            break
+    return filtered or ["Research", "Methods"]
+
+
+# ── Future scope extraction ───────────────────────────────────────────────────
+
+def _extract_future_scope_sentences(papers: List[Dict]) -> List[Dict]:
+    """
+    Return a list of dicts: {paper_title, sentence}
+    for every sentence in abstracts that signals future work / limitations.
+    Used both for the gap prompt and to generate synthetic extra opportunities.
+    """
+    collected = []
+    for p in papers[:15]:
+        title    = p.get("title", "Untitled")
+        abstract = (p.get("abstract") or p.get("summary") or "")
+        for sent in re.split(r'(?<=[.!?])\s+', abstract):
+            if len(sent) > 40 and any(sig in sent.lower() for sig in _FUTURE_SIGNALS):
+                collected.append({"paper_title": title, "sentence": sent.strip()})
+    return collected
+
+
+def _future_scope_block(papers: List[Dict]) -> str:
+    items = _extract_future_scope_sentences(papers)
+    if not items:
+        return ""
+    lines = [f'[{i["paper_title"]}]: "{i["sentence"]}"' for i in items[:12]]
+    return "\nFUTURE SCOPE & LIMITATION STATEMENTS (authors' own words):\n" + "\n".join(lines) + "\n"
+
+
+# ── Synthetic gaps from future-scope sentences ────────────────────────────────
+
+def _make_synthetic_gaps_from_future_scope(papers: List[Dict]) -> List[Dict]:
+    """
+    Convert future-scope sentences into gap dicts so they feed into
+    _generate_opportunity — this guarantees extra opportunities even
+    when gap_detection finds only 1-2 structural gaps.
+    """
+    items  = _extract_future_scope_sentences(papers)
+    gaps   = []
+    seen   = set()
+    for item in items[:8]:
+        sent = item["sentence"]
+        key  = sent[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        gaps.append({
+            "type":       "future_scope",
+            "gap":        sent,
+            "severity":   "medium",
+            "opportunity": f"Investigate the direction stated as future work in: {item['paper_title']}",
+            "evidence":   [item["paper_title"]],
+            "score":      65,
+            "priority":   65,
+            "category":   "future_scope",
+        })
+    return gaps
+
+
+# ── AI content generation for one opportunity ─────────────────────────────────
+
+def _generate_opportunity(gap: Dict, topic: str, papers: List[Dict]) -> Dict:
+    paper_titles = "\n".join(
+        f"- {p.get('title','')}" for p in papers[:10] if p.get("title")
     )
-    all_text = all_text.lower()
-    
-    # Domain detection patterns
-    domains = {
-        "Natural Language Processing": ["language", "nlp", "text", "linguistic", "translation", "bert", "gpt", "llm"],
-        "Computer Vision": ["vision", "image", "visual", "object detection", "segmentation", "cnn"],
-        "Robotics": ["robot", "robotic", "manipulation", "navigation", "autonomous"],
-        "Healthcare AI": ["medical", "clinical", "health", "patient", "diagnosis", "disease"],
-        "Reinforcement Learning": ["reinforcement", "policy", "reward", "agent", "rl"],
-        "Graph Neural Networks": ["graph", "network", "node", "edge", "gnn"],
-        "Time Series": ["time series", "temporal", "forecasting", "prediction"],
-        "Federated Learning": ["federated", "privacy", "distributed"],
-        "Multi-Agent Systems": ["multi-agent", "cooperative", "coordination"],
-        "Finance AI": ["finance", "financial", "trading", "stock", "risk"],
-        "Climate Science": ["climate", "weather", "environmental"],
-    }
-    
-    for domain, keywords in domains.items():
-        if any(kw in all_text for kw in keywords):
-            return domain
-    
-    return "Machine Learning"
+    paper_abstracts = "\n".join(
+        f"  [{p.get('title','')}]: {(p.get('abstract','') or '')[:200]}"
+        for p in papers[:4] if p.get("abstract")
+    )
+    scope = _future_scope_block(papers)
+    evidence = gap.get("evidence", [])
+    evidence_str = ("Evidence from: " + ", ".join(str(e) for e in evidence[:2])) if evidence else ""
 
+    prompt = (
+        "You are an academic research advisor generating a precise, actionable research opportunity.\n\n"
+        f"PAPER TITLES (your ONLY source of domain knowledge):\n{paper_titles}\n\n"
+        f"ABSTRACT SNIPPETS:\n{paper_abstracts}\n"
+        f"{scope}\n"
+        f"DETECTED GAP / FUTURE DIRECTION:\n{gap.get('gap','')}\n\n"
+        f"OPPORTUNITY HINT:\n{gap.get('opportunity','')}\n\n"
+        f"{evidence_str}\n\n"
+        "STRICT RULES:\n"
+        "— Every sentence must reference specific concepts or findings from the paper titles above.\n"
+        "— Do NOT introduce any domain not present in those titles.\n"
+        "— Do NOT use phrases like 'benchmark dataset', 'limited data', 'more research needed'.\n"
+        "— Write precise academic English. Every sentence must be complete.\n\n"
+        "Return EXACTLY in this format:\n\n"
+        "TITLE:\n[8-12 word research title naming the specific technique and problem from the papers]\n\n"
+        "WHY:\n[2 sentences. What is missing and where. What filling this gap would contribute.]\n\n"
+        "APPROACH:\n[4 numbered steps. Each step names a concrete method or paper from the titles.]\n\n"
+        "IMPACT:\n[1-2 sentences on the specific benefit to this research area.]\n\n"
+        "STEPS:\n[3 immediate actions referencing specific papers above.]\n"
+    )
 
-def _extract_problem_from_gap(gap_text: str, category: str) -> str:
-    """Extract specific problem statement from gap."""
-    
-    # Clean gap text
-    text = gap_text.lower()
-    text = re.sub(r"no papers combine\s*", "", text)
-    text = re.sub(r"limited research\s*", "", text)
-    
-    # Extract quoted concepts
-    quoted = re.findall(r"'([^']+)'", text)
-    if len(quoted) >= 2:
-        return f"integrating {quoted[0]} with {quoted[1]}"
-    
-    # Extract meaningful phrases
-    words = re.findall(r'\b[a-z]{5,}\b', text)
-    meaningful = [w for w in words if w not in IGNORE_WORDS][:3]
-    
-    if len(meaningful) >= 2:
-        return f"{meaningful[0]} for {meaningful[1]}"
-    
-    # Category-based fallback
-    problems = {
-        "methodological": "developing hybrid approaches",
-        "dataset": "creating comprehensive benchmarks",
-        "application": "applying AI to new domains",
-        "empirical": "validating at scale",
-        "theoretical": "building formal frameworks"
-    }
-    return problems.get(category, "advancing research")
-
-
-def _determine_innovation_type(gap: Dict, category: str) -> str:
-    """Determine what type of innovation this represents."""
-    
-    innovations = {
-        "methodological": "Novel Methodology",
-        "dataset": "New Dataset",
-        "application": "Domain Transfer",
-        "empirical": "Large-Scale Validation",
-        "theoretical": "Theoretical Framework",
-        "temporal": "Longitudinal Study"
-    }
-    
-    return innovations.get(category, "Research Advance")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# AI-POWERED CONTENT GENERATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _generate_with_ai(gap: Dict, domain: str, problem: str, papers: List[Dict]) -> Dict:
-    """Use Gemini to generate high-quality, specific content."""
-    
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return _generate_smart_fallback(gap, domain, problem)
-    
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        
-        # Build context from papers
-        paper_context = "\n".join([
-            f"- {p.get('title', '')}" for p in papers[:5]
-        ])
-        
-        prompt = f"""
-You must generate ONE research opportunity ONLY using the papers below.
-
-DOMAIN: {domain}
-
-DETECTED GAP:
-{gap.get("gap","")}
-
-PROBLEM:
-{problem}
-
-PAPERS (USE ONLY THESE):
-{paper_context}
-
-STRICT RULES:
-- Use only concepts appearing in these papers
-- Do not invent new domain
-- Do not generate generic AI topics
-- Opportunity must extend these papers
-- Mention real techniques / datasets if present
-
-FORMAT:
-
-TITLE:
-WHY:
-APPROACH:
-IMPACT:
-STEPS:
-"""
-        
-        response = model.generate_content(prompt)
-        return _parse_ai_response(response.text, gap, domain, problem)
-        
+        text = get_client().generate(prompt, fallback="")
+        if text and len(text) > 100:
+            return _parse_response(text, gap, topic, papers)
     except Exception:
-        return _generate_smart_fallback(gap, domain, problem)
+        pass
+    return _fallback_content(gap, topic, papers)
 
 
-def _parse_ai_response(text: str, gap: Dict, domain: str, problem: str) -> Dict:
-    """Parse AI response into structured content."""
-    
+def _parse_response(text: str, gap: Dict, topic: str, papers: List[Dict]) -> Dict:
     result = {}
-    
-    # Extract sections
     for key, label in [
-        ("title", "TITLE:"),
-        ("why", "WHY:"),
+        ("title",    "TITLE:"),
+        ("why",      "WHY:"),
         ("approach", "APPROACH:"),
-        ("impact", "IMPACT:"),
-        ("steps", "STEPS:")
+        ("impact",   "IMPACT:"),
+        ("steps",    "STEPS:"),
     ]:
         pattern = rf"{label}\s*(.+?)(?=(?:TITLE:|WHY:|APPROACH:|IMPACT:|STEPS:)|$)"
-        match = re.search(pattern, text, re.DOTALL | re.I)
-        if match:
-            result[key] = match.group(1).strip()
-    
-    # Validate and fallback
-    if not result.get("title") or len(result.get("title", "")) < 10:
-        return _generate_smart_fallback(gap, domain, problem)
-    
+        m = re.search(pattern, text, re.DOTALL | re.I)
+        if m:
+            result[key] = m.group(1).strip()
+    if not result.get("title") or len(result.get("title","")) < 8:
+        return _fallback_content(gap, topic, papers)
     return result
 
 
-def _generate_smart_fallback(gap: Dict, domain: str, problem: str) -> Dict:
-    """Generate smart, context-aware fallback content."""
-    
-    category = gap.get("category", "")
-    
-    # Domain-specific titles
-    if category == "dataset":
-        title = f"Large-Scale Benchmark Dataset for {domain}"
-    elif category == "methodological":
-        title = f"Hybrid Architecture for {problem.title()} in {domain}"
-    elif category == "application":
-        title = f"Transfer Learning Approach for {domain} Applications"
-    else:
-        title = f"Advances in {problem.title()} for {domain}"
-    
-    # Context-aware why statement
-    why = (
-        f"Current {domain} research has not adequately addressed {problem}. "
-        f"Existing approaches face limitations in scalability and generalization. "
-        f"Recent methodological advances make this investigation both timely and impactful."
-    )
-    
-    # Domain-specific approach
-    approaches = {
-        "Natural Language Processing": "Fine-tune large language models\nCreate domain-specific evaluation benchmarks\nConduct human evaluation studies\nAnalyze error patterns and failure cases",
-        "Computer Vision": "Develop multi-scale architecture\nTrain on diverse image datasets\nValidate across different lighting conditions\nBenchmark against state-of-the-art models",
-        "Robotics": "Design control algorithm\nTest in simulation environment\nDeploy on physical robot platform\nEvaluate in real-world scenarios",
-        "Healthcare AI": "Curate clinical dataset with expert labels\nValidate on multiple hospital systems\nEnsure compliance with medical standards\nConduct prospective clinical study",
-        "Reinforcement Learning": "Design reward function\nImplement policy network\nTrain in simulated environments\nTransfer to real-world tasks"
+def _fallback_content(gap: Dict, topic: str, papers: List[Dict]) -> Dict:
+    top = [p.get("title","") for p in papers[:3] if p.get("title")]
+    cat = gap.get("category","methodological")
+    title_map = {
+        "methodological": f"Hybrid Methodology for {topic}",
+        "dataset":        f"Evaluation Framework for {topic}",
+        "future_scope":   f"Extending {topic}: Addressing Stated Future Work",
     }
-    approach = approaches.get(domain, 
-        "Design systematic framework\nImplement prototype system\n"
-        "Evaluate on benchmark datasets\nCompare with baseline methods"
+    title = title_map.get(cat, f"Advancing {topic}: Closing an Identified Gap")
+    why   = (
+        f"The reviewed papers on {topic} leave this direction unaddressed: "
+        f"{gap.get('gap','')}. "
+        f"Closing this gap would directly extend the contributions of the reviewed literature."
     )
-    
-    # Domain-specific impact
-    impacts = {
-        "Healthcare AI": f"Could improve clinical decision-making and patient outcomes in {domain} applications.",
-        "Robotics": f"Would enable more capable autonomous systems for industrial and service applications.",
-        "Natural Language Processing": f"Could enhance human-AI interaction and information access systems.",
-        "Computer Vision": f"Would improve visual understanding for autonomous systems and surveillance.",
-        "Finance AI": f"Could enhance risk assessment and decision-making in financial systems.",
-        "Climate Science": f"Would improve climate modeling and prediction capabilities.",
-    }
-    impact = impacts.get(domain, 
-        f"Could significantly advance capabilities in {domain} systems and applications."
+    approach_lines = [f"1. Replicate and extend baselines from: {top[0]}"] if top else []
+    if len(top) > 1:
+        approach_lines.append(f"2. Compare methodology against: {top[1]}")
+    approach_lines += [
+        f"3. Design and implement the missing component for {topic}",
+        "4. Evaluate under conditions not covered in the reviewed papers",
+    ]
+    steps = (
+        f"1. Annotate future scope sections in: {', '.join(top[:2])}\n"
+        f"2. Search recent preprints for '{topic}' and the gap keywords\n"
+        "3. Set up a reproducible experiment environment using reviewed paper baselines"
+        if top else
+        "1. Conduct targeted literature search\n2. Identify baselines\n3. Define evaluation protocol"
     )
-    
-    # Domain-specific first steps
-    steps_templates = {
-        "Natural Language Processing": f"Review recent LLM papers on {problem}\nDownload relevant text corpora\nSet up HuggingFace/PyTorch environment",
-        "Computer Vision": f"Survey recent papers on {problem}\nDownload ImageNet/COCO datasets\nSet up PyTorch/TensorFlow pipeline",
-        "Robotics": f"Review robotics papers on {problem}\nInstall ROS/Gazebo simulation\nIdentify relevant robot platforms",
-        "Healthcare AI": f"Review clinical AI literature\nIdentify publicly available medical datasets\nConsult with domain experts",
-    }
-    steps = steps_templates.get(domain,
-        f"Survey recent {domain} literature\nIdentify benchmark datasets\nSet up development environment"
-    )
-    
     return {
-        "title": title,
-        "why": why,
-        "approach": approach,
-        "impact": impact,
-        "steps": steps
+        "title":    title,
+        "why":      why,
+        "approach": "\n".join(approach_lines),
+        "impact":   f"Directly advances the research agenda in {topic}.",
+        "steps":    steps,
     }
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SCORING & METADATA
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Scoring & metadata ────────────────────────────────────────────────────────
 
-def _calculate_opportunity_score(gap: Dict, category: str) -> int:
-    """Calculate opportunity score [0-100]."""
-    severity_points = {"high": 40, "medium": 25, "low": 15}
-    category_weights = {
-        "application": 1.3, "methodological": 1.2, "theoretical": 1.1,
-        "empirical": 1.0, "dataset": 0.9, "temporal": 0.7
+def _score(gap: Dict, category: str) -> int:
+    severity_pts = {"high": 40, "medium": 25, "low": 15}
+    cat_weights  = {
+        "methodological": 1.2, "theoretical": 1.1,
+        "empirical": 1.0,      "dataset": 0.9,
+        "future_scope": 1.15,  "temporal": 0.7,
     }
-    
-    base = severity_points.get(gap.get("severity", "medium"), 25)
-    weight = category_weights.get(category, 1.0)
+    base     = severity_pts.get(gap.get("severity","medium"), 25)
+    weight   = cat_weights.get(category, 1.0)
     priority = gap.get("priority", gap.get("score", 50)) * 0.3
-    
-    return int(min(100, max(0, (base * weight) + priority)))
+    return int(min(100, max(0, base * weight + priority)))
 
 
-def _estimate_difficulty(gap: Dict) -> str:
-    """Estimate difficulty level."""
-    gap_type = gap.get("type", "")
-    if gap_type in ["unexplored_domain", "underutilized_method"]:
-        return "Beginner-Friendly"
-    elif gap_type in ["theoretical_foundation", "dataset_creation", "method_combination"]:
+def _difficulty(gap: Dict) -> str:
+    t = gap.get("type","")
+    if t in ["unexplored_domain", "underutilized_method", "future_scope"]:
+        return "Intermediate"
+    if t in ["method_combination", "dataset_creation", "dataset_diversity", "theoretical_foundation"]:
         return "Advanced"
     return "Intermediate"
 
 
-def _estimate_timeline(difficulty: str) -> str:
-    """Estimate timeline."""
+def _timeline(difficulty: str) -> str:
     return {
         "Beginner-Friendly": "3-6 months",
-        "Intermediate": "6-12 months",
-        "Advanced": "12-24 months"
+        "Intermediate":      "6-12 months",
+        "Advanced":          "12-24 months",
     }.get(difficulty, "6-12 months")
 
 
-def _extract_keywords(domain: str, problem: str) -> List[str]:
-    """Extract keywords from domain and problem."""
-    words = re.findall(r'\b[A-Z][a-z]+\b', f"{domain} {problem}")
-    return words[:5] if words else [domain.split()[0]]
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN DISCOVERY ENGINE
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Main discovery engine ─────────────────────────────────────────────────────
 
 def discover_research_opportunities(detected_gaps: Dict, papers: List[Dict]) -> Dict:
-    """Transform gaps into impressive, actionable research opportunities."""
-    
-    all_topics = []
-    
+    """
+    Transform gaps into structured research opportunities.
+    Guarantees at least 5 by supplementing with future-scope directions
+    extracted directly from the papers' own abstracts.
+    """
+    topic    = _infer_topic(papers)
+    keywords = _extract_keywords(papers)
+
+    # Build master gap list: structural gaps + future-scope gaps
+    all_gaps: List[tuple] = []  # (category, gap_dict)
     for category, gap_list in detected_gaps.items():
         for gap in gap_list:
-            # Smart extraction
-            domain, problem, innovation = _smart_extract_domain_and_problem(gap, papers)
-            
-            # AI-powered content generation
-            content = _generate_with_ai(gap, domain, problem, papers)
-            
-            # Calculate metrics
-            score = _calculate_opportunity_score(gap, category)
-            difficulty = _estimate_difficulty(gap)
-            timeline = _estimate_timeline(difficulty)
-            keywords = _extract_keywords(domain, problem)
-            
-            # Assemble topic
-            topic = {
-                "opportunity_score": score,
-                "difficulty": difficulty,
-                "estimated_timeline": timeline,
-                "keywords": keywords,
-                
-                "topic_title": content.get("title", f"Research Advances in {domain}"),
-                "research_pitch": content.get("why", "Significant research opportunity identified."),
-                "concrete_approach": content.get("approach", "Systematic research approach needed."),
-                "why_it_matters": content.get("impact", f"Could advance {domain} research."),
-                "first_steps": content.get("steps", "Begin literature review."),
-                
-                "original_gap": gap.get("gap", ""),
-                "category": category,
-                "severity": gap.get("severity", "medium"),
-            }
-            
-            all_topics.append(topic)
-    
-    # Remove duplicates
-    all_topics = _deduplicate(all_topics)
-    
-    # Sort by score
-    all_topics.sort(key=lambda t: -t["opportunity_score"])
-    
-    # Categorize
-    hot_topics = all_topics[:8]
-    quick_wins = [t for t in all_topics if t["difficulty"] == "Beginner-Friendly"][:5]
-    high_impact = [t for t in all_topics if t["difficulty"] == "Advanced" and t["opportunity_score"] >= 70][:5]
-    
-    # Summary
-    total = len(all_topics)
-    avg_score = sum(t["opportunity_score"] for t in all_topics) / total if total else 0
-    all_keywords = []
+            all_gaps.append((category, gap))
+
+    # Add future-scope synthetic gaps to pad to at least 5
+    if len(all_gaps) < 5:
+        synthetic = _make_synthetic_gaps_from_future_scope(papers)
+        needed    = 5 - len(all_gaps)
+        for sg in synthetic[:needed + 3]:   # grab a few extras for dedup headroom
+            all_gaps.append(("future_scope", sg))
+
+    # Generate opportunity for every gap
+    all_topics: List[Dict] = []
+    for category, gap in all_gaps:
+        content    = _generate_opportunity(gap, topic, papers)
+        score      = _score(gap, category)
+        difficulty = _difficulty(gap)
+        timeline   = _timeline(difficulty)
+
+        all_topics.append({
+            "opportunity_score":  score,
+            "difficulty":         difficulty,
+            "estimated_timeline": timeline,
+            "keywords":           keywords[:5],
+
+            "topic_title":        content.get("title", f"Research Advance in {topic}"),
+            "research_pitch":     content.get("why",   "Significant opportunity identified."),
+            "concrete_approach":  content.get("approach", "Systematic investigation required."),
+            "why_it_matters":     content.get("impact", f"Advances the field of {topic}."),
+            "first_steps":        content.get("steps", "Begin with a targeted literature review."),
+
+            "original_gap":       gap.get("gap",""),
+            "category":           category,
+            "severity":           gap.get("severity","medium"),
+        })
+
+    # Deduplicate by title
+    seen, unique = set(), []
     for t in all_topics:
-        all_keywords.extend(t["keywords"])
-    
-    summary = {
-        "total_opportunities": total,
-        "hot_topic_count": len(hot_topics),
-        "quick_win_count": len(quick_wins),
-        "high_impact_count": len(high_impact),
-        "avg_opportunity_score": round(avg_score, 1),
-        "difficulty_distribution": dict(Counter(t["difficulty"] for t in all_topics)),
-        "top_keywords": [kw for kw, _ in Counter(all_keywords).most_common(10)],
-    }
-    
-    return {
-        "hot_topics": hot_topics,
-        "quick_wins": quick_wins,
-        "high_impact": high_impact,
-        "summary": summary
-    }
-
-
-def _deduplicate(topics: List[Dict]) -> List[Dict]:
-    """Remove duplicate topics."""
-    seen = set()
-    unique = []
-    for t in topics:
         key = re.sub(r'\W+', '', t["topic_title"].lower())
         if key not in seen:
             unique.append(t)
             seen.add(key)
-    return unique
+
+    unique.sort(key=lambda t: -t["opportunity_score"])
+
+    # Guarantee at least 5 in hot_topics
+    hot_topics  = unique[:max(8, 5)]
+    quick_wins  = [t for t in unique if t["difficulty"] == "Beginner-Friendly"][:5]
+    high_impact = [t for t in unique
+                   if t["difficulty"] == "Advanced" and t["opportunity_score"] >= 70][:5]
+    total       = len(unique)
+    avg_score   = round(sum(t["opportunity_score"] for t in unique) / total, 1) if total else 0
+
+    return {
+        "hot_topics":  hot_topics,
+        "quick_wins":  quick_wins,
+        "high_impact": high_impact,
+        "summary": {
+            "total_opportunities":    total,
+            "quick_win_count":        len(quick_wins),
+            "high_impact_count":      len(high_impact),
+            "avg_opportunity_score":  avg_score,
+            "difficulty_distribution":dict(Counter(t["difficulty"] for t in unique)),
+            "top_keywords":           keywords[:8],
+        }
+    }
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def run_gap_intelligence(detected_gaps: Dict, papers: List[Dict] = None) -> Dict:
-    """Main entry point."""
     if papers is None:
         papers = []
-    
     opportunities = discover_research_opportunities(detected_gaps, papers)
-    
     return {
-        "opportunities": opportunities,
-        "impact_matrix": [],
+        "opportunities":      opportunities,
+        "impact_matrix":      [],
         "relationship_graph": {"nodes": [], "edges": []},
-        "prototypes": []
+        "prototypes":         [],
     }

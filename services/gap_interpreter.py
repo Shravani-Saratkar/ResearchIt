@@ -1,38 +1,23 @@
 """
 Gap Interpretation & Justification Engine.
 Enriches each raw gap with AI reasoning.
-FIXED: always returns a proper gap dict — never propagates {"error":...} to session state.
+
+RATE-LIMIT FIX: Uses shared GroqClient (gemini_client.py) which provides:
+  - Prompt caching  (re-runs on same papers cost 0 API calls)
+  - Batch merging   (all gaps interpreted in 1-2 API calls instead of N)
+  - Exponential backoff + RPM throttle
 """
 
-import os
 from typing import Dict
-import google.generativeai as genai
+from gemini_client import get_client  # Groq-backed client (drop-in, same API)
 
 
-class GapInterpreter:
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        self.model = None
-        if api_key:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel("gemini-2.5-flash")
+# ─────────────────────────────────────────────
+# PROMPT BUILDER
+# ─────────────────────────────────────────────
 
-    def interpret_all_gaps(self, validated_gaps: Dict) -> Dict:
-        """Return enriched gaps. Falls back gracefully if model unavailable."""
-        interpreted = {}
-        for gap_type, gaps in validated_gaps.items():
-            interpreted[gap_type] = []
-            for gap in gaps:
-                enriched = gap.copy()
-                if self.model:
-                    enriched.update(self._interpret_single(gap))
-                else:
-                    enriched.update(self._fallback(gap))
-                interpreted[gap_type].append(enriched)
-        return interpreted
-
-    def _interpret_single(self, gap: Dict) -> Dict:
-        prompt = f"""You are an expert research reviewer.
+def _build_prompt(gap: Dict) -> str:
+    return f"""You are an expert research reviewer.
 
 Gap description : {gap.get('gap')}
 Gap type        : {gap.get('type')}
@@ -63,44 +48,90 @@ NOVELTY:
 PROPOSAL_GAP:
 <text>
 """
+
+
+# ─────────────────────────────────────────────
+# RESPONSE PARSER
+# ─────────────────────────────────────────────
+
+def _parse(text: str) -> Dict:
+    labels = {
+        "WHY_STOP":    "why_existing_work_stops_here",
+        "ASSUMPTION":  "implicit_assumption",
+        "RISK":        "research_risk",
+        "NOVELTY":     "novelty_claim",
+        "PROPOSAL_GAP":"proposal_ready_gap",
+    }
+    result, current, buf = {}, None, []
+    for line in text.splitlines():
+        line = line.strip()
+        key  = line.rstrip(":")
+        if key in labels:
+            if current and buf:
+                result[labels[current]] = " ".join(buf).strip()
+            current, buf = key, []
+        elif current:
+            buf.append(line)
+    if current and buf:
+        result[labels[current]] = " ".join(buf).strip()
+    return result
+
+
+def _fallback(gap: Dict) -> Dict:
+    return {
+        "why_existing_work_stops_here": "Methodological and conceptual constraints limit current studies.",
+        "implicit_assumption":          "Existing formulations are assumed sufficient.",
+        "research_risk":                "Increased complexity or reduced generalizability.",
+        "novelty_claim":                "Extends current methods by challenging prevailing assumptions.",
+        "proposal_ready_gap":           gap.get("gap", ""),
+    }
+
+
+# ─────────────────────────────────────────────
+# MAIN INTERPRETER  (batch version)
+# ─────────────────────────────────────────────
+
+class GapInterpreter:
+
+    def interpret_all_gaps(self, validated_gaps: Dict) -> Dict:
+        """
+        Collect ALL gap prompts, fire them as a single batch through
+        GroqClient, then reassemble results.
+        Zero duplicate API calls thanks to the shared cache.
+        """
+        # Flatten into ordered list
+        order  = []   # (gap_type, index_within_type)
+        prompts = []
+
+        for gap_type, gaps in validated_gaps.items():
+            for i, gap in enumerate(gaps):
+                order.append((gap_type, i))
+                prompts.append(_build_prompt(gap))
+
+        if not prompts:
+            return validated_gaps
+
+        # ONE batch call (may be split internally into groups of 5)
         try:
-            resp = self.model.generate_content(prompt)
-            return self._parse(resp.text)
-        except Exception:
-            return self._fallback(gap)
+            client  = get_client()
+            responses = client.generate_batch(prompts, fallback="")
+        except EnvironmentError:
+            # No API key — use fallback for every gap
+            responses = [""] * len(prompts)
 
-    @staticmethod
-    def _fallback(gap: Dict) -> Dict:
-        return {
-            "why_existing_work_stops_here": "Methodological and conceptual constraints limit current studies.",
-            "implicit_assumption":          "Existing formulations are assumed sufficient.",
-            "research_risk":                "Increased complexity or reduced generalizability.",
-            "novelty_claim":                "Extends current methods by challenging prevailing assumptions.",
-            "proposal_ready_gap":           gap.get("gap", ""),
-        }
+        # Rebuild the gap dict with enriched data
+        interpreted: Dict = {gt: list(gl) for gt, gl in validated_gaps.items()}
 
-    @staticmethod
-    def _parse(text: str) -> Dict:
-        labels = {
-            "WHY_STOP":    "why_existing_work_stops_here",
-            "ASSUMPTION":  "implicit_assumption",
-            "RISK":        "research_risk",
-            "NOVELTY":     "novelty_claim",
-            "PROPOSAL_GAP":"proposal_ready_gap",
-        }
-        result, current, buf = {}, None, []
-        for line in text.splitlines():
-            line = line.strip()
-            key  = line.rstrip(":")
-            if key in labels:
-                if current and buf:
-                    result[labels[current]] = " ".join(buf).strip()
-                current, buf = key, []
-            elif current:
-                buf.append(line)
-        if current and buf:
-            result[labels[current]] = " ".join(buf).strip()
-        return result
+        for (gap_type, i), raw_text in zip(order, responses):
+            gap     = validated_gaps[gap_type][i].copy()
+            enriched = _parse(raw_text) if raw_text else _fallback(gap)
+            # Ensure all keys are present
+            for k, v in _fallback(gap).items():
+                enriched.setdefault(k, v)
+            gap.update(enriched)
+            interpreted[gap_type][i] = gap
+
+        return interpreted
 
 
 def interpret_gaps(validated_gaps: Dict) -> Dict:
